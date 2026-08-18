@@ -52,15 +52,24 @@ import org.apache.spark.sql.internal.SQLConf
  * equality normalizes signed zero and NaN representations while projected expressions may observe
  * the original representation.
  *
- * The initial rule handles the direct logical shape:
+ * Two logical shapes are supported because an inequality self-join can appear either directly
+ * under the subquery Project or as either child of another inner join:
  *
- *   Project
- *     +- Inner self-join
+ *   Project                         Project (optional)
+ *     +- Inner self-join              +- Inner join
+ *                                         :- self-join or other side
+ *                                         +- self-join or other side
  *
- * Pre-existing LeftSemi/LeftAnti plans, EXISTS/ScalarSubquery shapes, nested self-joins under
- * another join, and Aggregate/Distinct wrappers above the candidate join are intentionally not
- * rewritten. Project expressions are supported when every reference to the eliminated self-join
- * can be remapped to an equality key that survives the aggregation.
+ * For the nested shape, every eligible self-join child is considered independently. Left and
+ * right children are semantically symmetric because IN does not observe subquery multiplicity;
+ * a child is rewritten only when every reference needed by the enclosing inner join can be
+ * remapped to equality keys that survive the aggregation.
+ *
+ * Pre-existing LeftSemi/LeftAnti plans, EXISTS/ScalarSubquery shapes, Aggregate/Distinct wrappers
+ * above the candidate join, and non-inner enclosing joins are intentionally not rewritten by this
+ * rule. The nested matcher is intentionally limited to an immediate self-join child (optionally
+ * wrapped by Project) of one enclosing InnerJoin; it does not traverse arbitrary Project/Filter/
+ * SubqueryAlias/Join chains in this first version.
  *
  * The implementation deliberately fails closed. In particular it requires:
  *   - an uncorrelated IN context;
@@ -78,7 +87,7 @@ import org.apache.spark.sql.internal.SQLConf
  *   - every equality/inequality pair to reference corresponding output slots from the two sides;
  *   - equality-key types not to require floating-point normalization;
  *   - no hint on the self-join being eliminated;
- *   - every projected output that depends on the self-join to be remappable to an equality key.
+ *   - every surviving reference to the eliminated side to be remappable to an equality key.
  *
  * Attribute correspondence is established by output position after proving that the two child
  * plans are canonically equal. Column names are never used as attribute identity.
@@ -98,6 +107,23 @@ object RewriteSelfJoinInequalityToAggregate
   private val MinAliasName = "_self_join_min"
   private val MaxAliasName = "_self_join_max"
 
+  private sealed trait NestedSide {
+    def child(join: Join): LogicalPlan
+    def replace(join: Join, newChild: LogicalPlan, newCondition: Expression): Join
+  }
+
+  private case object LeftSide extends NestedSide {
+    override def child(join: Join): LogicalPlan = join.left
+    override def replace(join: Join, newChild: LogicalPlan, newCondition: Expression): Join =
+      join.copy(left = newChild, condition = Some(newCondition))
+  }
+
+  private case object RightSide extends NestedSide {
+    override def child(join: Join): LogicalPlan = join.right
+    override def replace(join: Join, newChild: LogicalPlan, newCondition: Expression): Join =
+      join.copy(right = newChild, condition = Some(newCondition))
+  }
+
   private case class RelationCorrespondence(leftToRight: AttributeMap[Attribute]) {
     def areCorresponding(left: Attribute, right: Attribute): Boolean =
       leftToRight.get(left).exists(_.exprId == right.exprId)
@@ -109,6 +135,11 @@ object RewriteSelfJoinInequalityToAggregate
     def leftEquiKeys: Seq[Attribute] = equiPairs.map(_._1)
     def leftNeq: Attribute = neqPair._1
   }
+
+  private case class NestedRewriteState(
+      topProject: Option[Project],
+      outerJoin: Join,
+      rewritten: Boolean)
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     if (!conf.getConf(SQLConf.REWRITE_SELF_JOIN_INEQUALITY_TO_AGGREGATE_ENABLED)) {
@@ -128,13 +159,22 @@ object RewriteSelfJoinInequalityToAggregate
     if (!isCandidateSafe(plan)) return None
 
     plan match {
-      case project @ Project(_, selfJoin: Join) if isInnerJoin(selfJoin) =>
-        extractSelfJoin(selfJoin).flatMap { spec =>
-          rewriteDirectSelfJoin(project, selfJoin, spec)
-        }
+      case p @ Project(_, j: Join) if isInnerJoin(j) =>
+        rewriteJoinCandidate(Some(p), j)
+      case j: Join if isInnerJoin(j) =>
+        rewriteJoinCandidate(None, j)
       case _ =>
         None
     }
+  }
+
+  private def rewriteJoinCandidate(
+      topProject: Option[Project],
+      topJoin: Join): Option[LogicalPlan] = {
+    val direct = extractSelfJoin(topJoin).flatMap { spec =>
+      rewriteDirectSelfJoin(topProject, topJoin, spec)
+    }
+    direct.orElse(rewriteNestedSelfJoins(topProject, topJoin))
   }
 
   // --------------------------------------------------------------------------
@@ -142,19 +182,146 @@ object RewriteSelfJoinInequalityToAggregate
   // --------------------------------------------------------------------------
 
   private def rewriteDirectSelfJoin(
-      project: Project,
+      topProject: Option[Project],
       selfJoin: Join,
       spec: SelfJoinSpec): Option[LogicalPlan] = {
     // IN consumes ListQuery output positionally. A bare self-join exposes both sides' full
     // schemas, so replacing it with only equality keys would change arity/position. Require a
     // Project whose output can be remapped safely while preserving its positional schema.
-    // `rewriteKeyProject` takes its new child by name, so the aggregation is only built once the
-    // whole project list has been proven remappable.
-    rewriteKeyProject(
-      project.projectList,
-      spec,
-      selfJoin.outputSet,
-      buildAggregate(spec.leftEquiKeys, spec.leftNeq, selfJoin.left))
+    topProject.flatMap { project =>
+      rewriteKeyProject(
+        project.projectList,
+        spec,
+        selfJoin.outputSet,
+        buildAggregate(spec.leftEquiKeys, spec.leftNeq, selfJoin.left)).map(_._1)
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Nested self-join: either child of another InnerJoin in the subquery.
+  // --------------------------------------------------------------------------
+
+  private def rewriteNestedSelfJoins(
+      topProject: Option[Project],
+      outerJoin: Join): Option[LogicalPlan] = {
+    val initial = NestedRewriteState(topProject, outerJoin, rewritten = false)
+
+    // Left and right are semantically symmetric. Process both so:
+    //   1. a rejected candidate on one side never blocks an eligible candidate on the other; and
+    //   2. if both children contain eligible self-joins, both can be eliminated in this Once batch.
+    val finalState = Seq(LeftSide, RightSide).foldLeft(initial) { (state, side) =>
+      rewriteNestedSide(state, side).getOrElse(state)
+    }
+
+    if (!finalState.rewritten) {
+      None
+    } else {
+      finalState.topProject match {
+        case Some(project) => Some(project)
+        case None => Some(finalState.outerJoin)
+      }
+    }
+  }
+
+  private def rewriteNestedSide(
+      state: NestedRewriteState,
+      side: NestedSide): Option[NestedRewriteState] = {
+    val selfJoinSide = side.child(state.outerJoin)
+
+    state.outerJoin.condition.flatMap { outerCondition =>
+      // As with Project remapping, ordinary expression transforms do not descend into a subquery
+      // plan. Fail closed instead of partially remapping outer references in the join condition.
+      if (SubqueryExpression.hasSubquery(outerCondition)) {
+        None
+      } else {
+        extractSelfJoinSide(selfJoinSide).flatMap { case (wrapper, selfJoin, spec) =>
+          val selfJoinOutput = selfJoinSide.outputSet
+          val equiKeys = AttributeSet(spec.equiPairs.flatMap { case (l, r) => Seq(l, r) })
+          val wrapperEquiKeys = AttributeSet(wrapper.toSeq.flatMap(_.projectList.flatMap {
+            case a: Attribute if equiKeys.contains(a) => Some(a)
+            case al @ Alias(a: Attribute, _) if equiKeys.contains(a) => Some(al.toAttribute)
+            case _ => None
+          }))
+          val visibleEquiKeys = equiKeys ++ wrapperEquiKeys
+
+          // Only equality-key references from the self-join side may survive in the enclosing join.
+          val outerRefsFromSelfJoin = outerCondition.references.filter(selfJoinOutput.contains)
+          if (!outerRefsFromSelfJoin.forall(visibleEquiKeys.contains)) {
+            None
+          } else {
+            // IN consumes ListQuery output positionally. A top-level Project may freely reference
+            // the other outer-join side, but any reference to the candidate self-join side must be
+            // an equality key that can be remapped after the self-join is eliminated.
+            val topProjectIsSafe = state.topProject.forall { p =>
+              p.projectList.flatMap(_.references).filter(selfJoinOutput.contains)
+                .forall(visibleEquiKeys.contains)
+            }
+
+            if (!topProjectIsSafe) {
+              None
+            } else {
+              // `rewriteKeyProject` takes its new child by name, so the aggregation -- and the
+              // constraint check it performs -- is only built once the surviving outputs have been
+              // proven remappable. Lazy rather than a def: the branches below are alternatives, and
+              // building the aggregation twice would mint two sets of MIN/MAX ExprIds.
+              lazy val replacement: LogicalPlan =
+                buildAggregate(spec.leftEquiKeys, spec.leftNeq, selfJoin.left)
+
+              val rewrittenSide = wrapper match {
+                case Some(project) =>
+                  rewriteKeyProject(project.projectList, spec, selfJoin.outputSet, replacement)
+
+                case None if state.topProject.isEmpty =>
+                  // Without either Project layer the enclosing Join exposes the old two-sided
+                  // self-join schema directly. Replacing it would change ListQuery arity/position.
+                  None
+
+                case None =>
+                  // Preserve distinct output identities for the old left and right equality-key
+                  // slots. Mapping both old attributes straight to the surviving left key would
+                  // make a top Project such as SELECT l.k, r.k produce duplicate ExprIds.
+                  val keySlots: Seq[NamedExpression] = spec.equiPairs.flatMap {
+                    case (l, r) => Seq(l, r)
+                  }
+                  rewriteKeyProject(keySlots, spec, selfJoin.outputSet, replacement)
+              }
+
+              rewrittenSide.flatMap { case (newSelfJoinSide, outputRemap) =>
+                val newOuterCondition = outerCondition.transformUp {
+                  case a: Attribute if outputRemap.contains(a) => outputRemap(a)
+                }
+
+                val newOuterJoin = side.replace(state.outerJoin, newSelfJoinSide, newOuterCondition)
+
+                state.topProject match {
+                  case Some(project) =>
+                    rewriteProjectList(
+                      project.projectList, outputRemap, selfJoinOutput).map { newProjectList =>
+                      NestedRewriteState(
+                        Some(Project(newProjectList, newOuterJoin)),
+                        newOuterJoin,
+                        rewritten = true)
+                    }
+                  case None =>
+                    Some(NestedRewriteState(None, newOuterJoin, rewritten = true))
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private def extractSelfJoinSide(
+      plan: LogicalPlan): Option[(Option[Project], Join, SelfJoinSpec)] = {
+    plan match {
+      case p @ Project(_, j: Join) if isInnerJoin(j) =>
+        extractSelfJoin(j).map(s => (Some(p), j, s))
+      case j: Join if isInnerJoin(j) =>
+        extractSelfJoin(j).map(s => (None, j, s))
+      case _ => None
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -248,7 +415,7 @@ object RewriteSelfJoinInequalityToAggregate
     val equiKeyTypes = equiPairs.map(_._1.dataType)
 
     // Equality keys whose values Spark normalizes cannot be substituted inside an arbitrary
-    // projected expression: -0.0 and 0.0 compare equal as join and grouping keys, yet an
+    // surviving expression: -0.0 and 0.0 compare equal as join and grouping keys, yet an
     // expression over their original representations tells them apart, and this rule may
     // substitute one side's key. Fail closed for exactly the types Spark itself considers
     // normalization-sensitive. The inequality value is not substituted and may still be
@@ -326,20 +493,23 @@ object RewriteSelfJoinInequalityToAggregate
       projectList: Seq[NamedExpression],
       spec: SelfJoinSpec,
       eliminatedOutput: AttributeSet,
-      newChild: => LogicalPlan): Option[Project] = {
+      newChild: => LogicalPlan): Option[(Project, AttributeMap[Attribute])] = {
     val keyRemap = AttributeMap(
       spec.leftEquiKeys.map(a => a -> a) ++ spec.equiPairs.map { case (l, r) => r -> l })
+    val oldOutput = projectList.map(_.toAttribute)
 
     rewriteProjectList(projectList, keyRemap, eliminatedOutput).map { rewritten =>
       val child = newChild
-      Project(rewritten, child)
+      val newProject = Project(rewritten, child)
+      (newProject, AttributeMap(oldOutput.zip(newProject.output)))
     }
   }
 
   /**
    * Remap references to an eliminated subtree inside a Project.
    *
-   * References to attributes outside `eliminatedOutput` are left untouched.
+   * References to attributes outside `eliminatedOutput` are left untouched, which lets the same
+   * helper serve both the direct rewrite and the enclosing Project of the nested rewrite.
    */
   private def rewriteProjectList(
       projectList: Seq[NamedExpression],
