@@ -26,21 +26,14 @@ import org.apache.spark.rdd.{DeterministicLevel, RDD}
 import org.apache.spark.sql.catalyst.{FileSourceOptions, InternalRow}
 import org.apache.spark.sql.catalyst.analysis.MultiInstanceRelation
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.{logical, QueryPlan}
+import org.apache.spark.sql.catalyst.plans.{logical, QueryPlan, Repeatability}
 import org.apache.spark.sql.catalyst.plans.logical.{ColumnStat, LogicalPlan, Statistics}
-import org.apache.spark.sql.catalyst.trees.TreePattern.CURRENT_LIKE
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.{truncatedString, CaseInsensitiveMap}
 import org.apache.spark.sql.columnar.{CachedBatch, CachedBatchSerializer, SimpleMetricsCachedBatch, SimpleMetricsCachedBatchSerializer}
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
-import org.apache.spark.sql.execution.datasources.{FileFormat, FileScanRDD, HadoopFsRelation, LogicalRelation}
-import org.apache.spark.sql.execution.datasources.binaryfile.BinaryFileFormat
-import org.apache.spark.sql.execution.datasources.csv.CSVFileFormat
-import org.apache.spark.sql.execution.datasources.json.JsonFileFormat
-import org.apache.spark.sql.execution.datasources.orc.OrcFileFormat
-import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
-import org.apache.spark.sql.execution.datasources.text.TextFileFormat
+import org.apache.spark.sql.execution.datasources.{FileScanRDD, FileSourceRepeatability, HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.vectorized.{OffHeapColumnVector, OnHeapColumnVector, WritableColumnVector}
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 import org.apache.spark.sql.types._
@@ -376,10 +369,7 @@ case class CachedRDDBuilder(
         val cachedPlanConf = cachedPlan.conf.clone()
 
         def hasStrictReads(conf: SQLConf): Boolean = SQLConf.withExistingConf(conf) {
-          fileSourceOptions.forall { options =>
-            val effectiveOptions = new FileSourceOptions(options)
-            !effectiveOptions.ignoreMissingFiles && !effectiveOptions.ignoreCorruptFiles
-          }
+          fileSourceOptions.forall(FileSourceRepeatability.hasStrictReads)
         }
 
         val (inputRDD, strictPhysicalReads) = SQLConf.withExistingConf(materializationConf) {
@@ -464,33 +454,6 @@ case class CachedRDDBuilder(
 
 object InMemoryRelation extends PredicateHelper {
 
-  private val trustedFileFormatClasses: Set[Class[_ <: FileFormat]] = Set(
-    classOf[BinaryFileFormat],
-    classOf[CSVFileFormat],
-    classOf[JsonFileFormat],
-    classOf[OrcFileFormat],
-    classOf[ParquetFileFormat],
-    classOf[TextFileFormat])
-
-  private val trustedExternalFileFormatNames = Set(
-    "org.apache.spark.sql.avro.AvroFileFormat",
-    "org.apache.spark.sql.hive.orc.OrcFileFormat")
-
-  private val catalystExpressionPackage = "org.apache.spark.sql.catalyst.expressions."
-
-  private def hasSafeExpressions(plan: QueryPlan[_]): Boolean = {
-    // Treat the Catalyst namespace as the trust boundary for Expression.deterministic's
-    // repeatability contract. Expressions outside it fail closed; reject AesEncrypt and
-    // opaque/user-defined expressions explicitly.
-    plan.expressions.forall { expression =>
-      !expression.exists {
-        case _: AesEncrypt | _: NonSQLExpression | _: UserDefinedExpression => true
-        case value => !value.deterministic || value.containsPattern(CURRENT_LIKE) ||
-          !value.getClass.getName.startsWith(catalystExpressionPackage)
-      }
-    }
-  }
-
   private def hasRepeatableLogicalPlan(
       analyzedPlan: LogicalPlan,
       plan: LogicalPlan,
@@ -501,7 +464,7 @@ object InMemoryRelation extends PredicateHelper {
     var repeatable = analyzedPlan.deterministic
     if (repeatable) {
       analyzedPlan.foreachWithSubqueries { node =>
-        if (repeatable && !hasSafeExpressions(node)) {
+        if (repeatable && !Repeatability.hasSafeExpressions(node)) {
           repeatable = false
         }
       }
@@ -512,14 +475,12 @@ object InMemoryRelation extends PredicateHelper {
     plan.foreachWithSubqueries { node =>
       onOptimizedNode(node)
       if (repeatable) {
-        repeatable = hasSafeExpressions(node) && (node match {
+        repeatable = Repeatability.hasSafeExpressions(node) && (node match {
           case _: logical.Project | _: logical.Filter | _: logical.SubqueryAlias |
                _: logical.Range | _: logical.LocalRelation => true
           case relation: LogicalRelation => relation.relation match {
             case fileRelation: HadoopFsRelation =>
-              val fileFormatClass = fileRelation.fileFormat.getClass
-              trustedFileFormatClasses.contains(fileFormatClass) ||
-                trustedExternalFileFormatNames.contains(fileFormatClass.getName)
+              FileSourceRepeatability.isTrustedFileFormat(fileRelation.fileFormat)
             case _ => false
           }
           case _ => false
@@ -537,7 +498,7 @@ object InMemoryRelation extends PredicateHelper {
              _: RangeExec | _: WholeStageCodegenExec => true
         case _ => false
       }
-      !supported || node.subqueries.nonEmpty || !hasSafeExpressions(node)
+      !supported || node.subqueries.nonEmpty || !Repeatability.hasSafeExpressions(node)
     }
   }
 

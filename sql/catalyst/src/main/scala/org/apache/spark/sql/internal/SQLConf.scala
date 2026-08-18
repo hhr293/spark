@@ -669,6 +669,16 @@ object SQLConf {
         "for using switch statements in InSet must be non-negative and less than or equal to 600")
       .createWithDefault(400)
 
+  val REWRITE_SELF_JOIN_INEQUALITY_TO_AGGREGATE_ENABLED =
+    buildConf("spark.sql.optimizer.rewriteSelfJoinInequalityToAggregate.enabled")
+      .internal()
+      .doc("When true, rewrites supported existence-only inequality self-joins into " +
+        "a MIN/MAX aggregation over one copy of the relation.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
   private val VALID_LOG_LEVELS: Array[String] = Level.values.map(_.toString)
 
   val PLAN_CHANGE_LOG_LEVEL = buildConf("spark.sql.planChangeLog.level")

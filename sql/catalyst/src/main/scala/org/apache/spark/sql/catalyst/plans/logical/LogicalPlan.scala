@@ -243,6 +243,26 @@ trait LeafNode extends LogicalPlan with LeafLike[LogicalPlan] {
 }
 
 /**
+ * A leaf node that can state whether reading its output more than once within one query returns the
+ * same rows.
+ *
+ * `deterministic` does not answer that question. It only reports that a plan's expressions are
+ * deterministic, and a leaf commonly has no expressions at all, so a relation backed by an
+ * arbitrary RDD or connector is trivially deterministic while the data behind it may differ between
+ * two reads. Rules that scan a leaf's output again, or that fold two evaluations of it into one,
+ * need the stronger guarantee and must treat a leaf that does not implement this trait as not
+ * repeatable. Catalyst's own pure leaves carry their rows in the plan or generate them from
+ * constants, so they are repeatable by construction and do not implement this trait.
+ */
+private[sql] trait RepeatableLeafNode extends LeafNode {
+  /**
+   * Whether scanning this leaf's output again returns the same rows. Implementations must fail
+   * closed and report `false` unless the underlying source is known to be stable across reads.
+   */
+  def isOutputRepeatable: Boolean
+}
+
+/**
  * A single observation of a fully materialized leaf's current cache generation.
  */
 private[sql] case class MaterializedLeafMetadata(
@@ -258,7 +278,7 @@ private[sql] case class MaterializedLeafMetadata(
  * [[org.apache.spark.sql.catalyst.optimizer.InjectRuntimeFilter]] to determine whether its output
  * can be scanned again safely and profitably to build a runtime filter.
  */
-private[sql] trait MaterializedLeafNode extends LeafNode {
+private[sql] trait MaterializedLeafNode extends RepeatableLeafNode {
   /** A complete, generation-consistent snapshot, if the leaf is fully materialized. */
   def materializedMetadata: Option[MaterializedLeafMetadata]
 
@@ -274,7 +294,7 @@ private[sql] trait MaterializedLeafNode extends LeafNode {
     mayHaveUsableMaterializedStats && materializedMetadata.exists(_.statsAvailable)
 
   /** Whether scanning the materialized output again returns the same rows. */
-  def isOutputRepeatable: Boolean = materializedMetadata.exists(_.isOutputRepeatable)
+  override def isOutputRepeatable: Boolean = materializedMetadata.exists(_.isOutputRepeatable)
 
   /** Whether the original plan contains a predicate that is likely to be selective. */
   def hasSelectivePredicate: Boolean

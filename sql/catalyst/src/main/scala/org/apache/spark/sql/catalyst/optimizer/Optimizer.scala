@@ -289,6 +289,10 @@ abstract class Optimizer(catalogManager: CatalogManager)
     // The following batch should be executed after batch "Join Reorder" and "LocalRelation".
     Batch("Check Cartesian Products", Once,
       CheckCartesianProducts),
+    // This rule must observe InSubquery after subqueries have been optimized and before
+    // RewritePredicateSubquery converts predicate subqueries to existence/semi/anti joins.
+    Batch("Rewrite Self Join Inequality", Once,
+      RewriteSelfJoinInequalityToAggregate),
     Batch("RewriteSubquery", Once,
       RewritePredicateSubquery,
       NullPropagation,

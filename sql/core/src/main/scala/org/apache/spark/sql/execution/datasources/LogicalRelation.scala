@@ -20,7 +20,7 @@ import org.apache.spark.sql.catalyst.analysis.{MultiInstanceRelation, Normalizea
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.expressions.{AttributeMap, AttributeReference}
 import org.apache.spark.sql.catalyst.plans.QueryPlan
-import org.apache.spark.sql.catalyst.plans.logical.{ExposesMetadataColumns, LeafNode, LogicalPlan, Statistics, StreamSourceAwareLogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{ExposesMetadataColumns, LeafNode, LogicalPlan, RepeatableLeafNode, Statistics, StreamSourceAwareLogicalPlan}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.catalyst.util.{truncatedString, CharVarcharUtils}
 import org.apache.spark.sql.connector.read.streaming.SparkDataStream
@@ -46,12 +46,18 @@ case class LogicalRelation(
   with StreamSourceAwareLogicalPlan
   with MultiInstanceRelation
   with ExposesMetadataColumns
-  with NormalizeableRelation {
+  with NormalizeableRelation
+  with RepeatableLeafNode {
 
   // Only care about relation when canonicalizing.
   override def doCanonicalize(): LogicalPlan = copy(
     output = output.map(QueryPlan.normalizeExpressions(_, output)),
     catalogTable = None)
+
+  // A streaming source returns new rows by design; among batch relations only trusted file formats
+  // read strictly are known to read back exactly what the files hold. See FileSourceRepeatability.
+  override def isOutputRepeatable: Boolean =
+    !isStreaming && FileSourceRepeatability.isRepeatable(relation)
 
   override def computeStats(): Statistics = {
     catalogTable
