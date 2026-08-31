@@ -679,7 +679,7 @@ object SQLConf {
       .version("4.4.0")
       .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
       .booleanConf
-      .createWithDefault(false)
+      .createWithDefault(true)
 
   private val VALID_LOG_LEVELS: Array[String] = Level.values.map(_.toString)
 
