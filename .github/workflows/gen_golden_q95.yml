@@ -1,0 +1,122 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+# VALIDATION-ONLY helper (DO NOT MERGE upstream).
+#
+# Regenerates the tpcds-v1.4/q95 plan-stability golden files in a clean
+# GitHub Actions runner, so the golden plans have a reproducible provenance
+# instead of being produced on someone's local machine.
+#
+# This runs on the `validate-default-on` branch where
+# spark.sql.optimizer.rewriteSelfJoinInequalityToAggregate defaults to ON,
+# so the regenerated plans reflect the REWRITTEN q95 physical plan.
+# These files must NOT be ported to the upstream PR branch (the rule
+# defaults to OFF there, so q95's plan is unchanged).
+#
+# Triggered by pushing this file (path-scoped) so it does not require the
+# workflow to live on the fork's default branch. The golden commit it pushes
+# back touches only sql/core paths, so it does not re-trigger this workflow.
+
+name: Generate q95 plan-stability golden files
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - validate-default-on
+    paths:
+      - '.github/workflows/gen_golden_q95.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  gen-golden:
+    name: Regenerate tpcds-v1.4/q95 golden plans (rule ON)
+    runs-on: ubuntu-latest
+    env:
+      SPARK_LOCAL_IP: localhost
+    steps:
+      - name: Checkout Spark repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Cache SBT and Maven
+        uses: actions/cache@v5
+        with:
+          path: |
+            build/apache-maven-*
+            build/*.jar
+            ~/.sbt
+          key: build-${{ hashFiles('**/pom.xml', 'project/build.properties', 'build/mvn', 'build/sbt', 'build/sbt-launch-lib.bash', 'build/spark-build-info') }}
+          restore-keys: |
+            build-
+      - name: Cache Coursier local repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/coursier
+          key: golden-coursier-${{ hashFiles('**/pom.xml', '**/plugins.sbt') }}
+          restore-keys: |
+            golden-coursier-
+      - name: Install Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: '17'
+      - name: Regenerate tpcds-v1.4/q95 golden files
+        run: |
+          SPARK_GENERATE_GOLDEN_FILES=1 build/sbt "sql/testOnly *PlanStability*Suite -- -z (tpcds-v1.4/q95)"
+      - name: Show regenerated files
+        run: |
+          git status --porcelain \
+            sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q95 \
+            sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q95.sf100
+      - name: Upload regenerated golden files
+        uses: actions/upload-artifact@v7
+        with:
+          name: q95-golden-plans
+          path: |
+            sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q95/**
+            sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q95.sf100/**
+      - name: Commit and push regenerated golden files
+        run: |
+          git config --local user.name "${{ github.actor }}"
+          git config --local user.email "${{ format('{0}@users.noreply.github.com', github.actor) }}"
+          git add \
+            sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q95 \
+            sql/core/src/test/resources/tpcds-plan-stability/approved-plans-v1_4/q95.sf100
+          if git diff --cached --quiet; then
+            echo "No golden file changes to commit."
+            exit 0
+          fi
+          git commit -m "[VALIDATION-ONLY] Regenerate tpcds-v1.4/q95 plan-stability golden (rule ON)" \
+                     -m "Generated in GitHub Actions by *PlanStability*Suite with spark.sql.optimizer.rewriteSelfJoinInequalityToAggregate default-on. Reflects the rewritten q95 physical plan. Not for the upstream PR (rule defaults off there, so q95's plan is unchanged)."
+          for i in 1 2 3 4 5; do
+            echo "Attempt $i to push..."
+            git fetch origin "${{ github.ref_name }}"
+            git rebase "origin/${{ github.ref_name }}"
+            if git push origin "HEAD:${{ github.ref_name }}"; then
+              echo "Push successful."
+              exit 0
+            fi
+            echo "Push failed, retrying in 3s..."
+            sleep 3
+          done
+          echo "Error: failed to push after 5 attempts."
+          exit 1
